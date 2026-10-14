@@ -1,85 +1,59 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import os, uuid, shutil, yt_dlp
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import yt_dlp
-import os
-import uuid
+from starlette.background import BackgroundTask
 
-app = FastAPI(title="SnapDown Pro Backend")
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+                   allow_headers=["*"], expose_headers=["Content-Disposition"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-class InfoRequest(BaseModel):
+class Info(BaseModel):
     url: str
 
-class DownloadRequest(BaseModel):
+class Dl(BaseModel):
     url: str
-    format_id: str
+    kind: str = "video"      # video | audio
+    height: int = 720
+    audio_fmt: str = "mp3"   # mp3 | m4a
+    abr: int = 192
 
 @app.get("/")
 def home():
     return {"status": "SnapDown API is running"}
 
 @app.post("/api/info")
-def get_video_info(req: InfoRequest):
-    ydl_opts = {'quiet': True, 'no_warnings': True}
+def info(r: Info):
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-            formats = []
-            for f in info.get('formats', []):
-                if f.get('ext') in ['mp4', 'm4a', 'mp3']:
-                    formats.append({
-                        'format_id': f.get('format_id'),
-                        'resolution': f.get('resolution') or f.get('format_note') or 'Audio',
-                        'ext': f.get('ext'),
-                        'filesize': f.get('filesize') or f.get('filesize_approx') or 0
-                    })
-            return {
-                "title": info.get('title', 'Video'),
-                "thumbnail": info.get('thumbnail'),
-                "duration": info.get('duration'),
-                "formats": formats[-8:]
-            }
+        with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as y:
+            i = y.extract_info(r.url, download=False)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, str(e)[:300])
+    hs = sorted({f["height"] for f in i.get("formats", [])
+                 if f.get("height") and f.get("vcodec") != "none"})
+    return {"title": i.get("title"), "thumbnail": i.get("thumbnail"),
+            "duration": i.get("duration"), "heights": hs}
 
 @app.post("/api/download")
-def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
-    file_id = str(uuid.uuid4())[:8]
-    output_template = f"{DOWNLOAD_DIR}/{file_id}_%(title)s.%(ext)s"
-    
-    ydl_opts = {
-        'format': req.format_id if req.format_id else 'best',
-        'outtmpl': output_template,
-        'quiet': True
-    }
-    
+def download(r: Dl):
+    d = os.path.join("downloads", uuid.uuid4().hex)
+    os.makedirs(d, exist_ok=True)
+    o = {"outtmpl": f"{d}/%(title).80s.%(ext)s", "noplaylist": True, "quiet": True}
+    if r.kind == "audio":
+        o["format"] = "bestaudio/best"
+        o["postprocessors"] = [{"key": "FFmpegExtractAudio",
+                                "preferredcodec": r.audio_fmt,
+                                "preferredquality": str(r.abr)}]
+    else:
+        o["format"] = f"bestvideo[height<={r.height}]+bestaudio/best[height<={r.height}]/best"
+        o["merge_output_format"] = "mp4"
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=True)
-            filename = ydl.prepare_filename(info)
-            
-            def cleanup():
-                if os.path.exists(filename):
-                    os.remove(filename)
-
-            background_tasks.add_task(cleanup)
-            
-            return FileResponse(
-                path=filename, 
-                filename=os.path.basename(filename),
-                media_type='application/octet-stream'
-            )
+        with yt_dlp.YoutubeDL(o) as y:
+            y.extract_info(r.url, download=True)
+        path = os.path.join(d, os.listdir(d)[0])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        shutil.rmtree(d, ignore_errors=True)
+        raise HTTPException(400, str(e)[:300])
+    return FileResponse(path, filename=os.path.basename(path),
+                        background=BackgroundTask(shutil.rmtree, d, True))
